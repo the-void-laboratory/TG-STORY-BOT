@@ -2,15 +2,9 @@
  * TG Story Bot
  * Posts photos/videos to your Telegram story via the MTProto client API.
  *
- * How it works:
- * 1. You (the owner) send a photo or video to the bot.
- * 2. The bot receives it and uses your Telegram USER session (GramJS)
- * to post it as a story on your account.
- *
  * Requirements:
  * - BOT_TOKEN      → from @BotFather
  * - API_ID + API_HASH → from https://my.telegram.org/apps
- * - SESSION_STRING → generated once via `node setup.js`
  */
 
 require("dotenv").config();
@@ -28,17 +22,26 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_ID = parseInt(process.env.API_ID, 10);
 const API_HASH = process.env.API_HASH;
 const SESSION_STRING = process.env.SESSION_STRING || "";
-const COOLDOWN_SECONDS = parseInt(process.env.COOLDOWN_SECONDS || "300", 10); // Default 5 minutes (300 seconds)
-const OWNER_ID = parseInt(process.env.OWNER_ID, 10); // Only you can use the bot
+const COOLDOWN_SECONDS = parseInt(process.env.COOLDOWN_SECONDS || "300", 10);
+const OWNER_ID = parseInt(process.env.OWNER_ID, 10);
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!BOT_TOKEN || !API_ID || !API_HASH) {
-  console.error("❌  Missing BOT_TOKEN, API_ID, or API_HASH in .env");
+  console.error("❌ Missing BOT_TOKEN, API_ID, or API_HASH in .env");
   process.exit(1);
 }
 
-// ── Telegram Bot (node-telegram-bot-api) ──────────────────────────────────────
+// ── Telegram Bot Initialisation ──────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// Handle unexpected polling errors gracefully without crashing the engine
+bot.on("polling_error", (error) => {
+  if (error.message.includes("409 Conflict")) {
+    console.warn("⚠️ Dual polling conflict noticed. Another container instance is shutting down...");
+  } else {
+    console.error("📋 Polling Error:", error.message);
+  }
+});
 
 // ── Settings Persistence ─────────────────────────────────────────────────────
 let db, sessionsColl, settingsColl;
@@ -57,7 +60,7 @@ async function initDB() {
     console.log("✅ Connected to MongoDB");
   } catch (err) {
     console.error("❌ MongoDB Connection Error:", err.message);
-    console.warn("⚠️ Falling back to memory (non-persistent) mode.");
+    console.warn("⚠️ Falling back to memory mode.");
   }
 }
 
@@ -77,13 +80,13 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-// Global runtime memory maps
+// Global runtime maps
 const activeClients = new Map(); 
-const pendingStories = new Map(); // Store pending stories per user ID
-const waitingForCaption = new Set(); // User IDs waiting to send a custom caption
-const waitingForCustomTime = new Set(); // User IDs waiting for custom minutes input
-const userCooldowns = new Map(); // userId -> lastPostTimestamp (for cooldown)
-const loginStates = new Map();   // Track login progress per user
+const pendingStories = new Map(); 
+const waitingForCaption = new Set(); 
+const waitingForCustomTime = new Set(); 
+const userCooldowns = new Map(); 
+const loginStates = new Map();   
 
 async function getClient(userId) {
   let client = activeClients.get(userId);
@@ -100,7 +103,6 @@ async function getClient(userId) {
   }
 
   if (await client.isUserAuthorized()) {
-    // Re-assert offline status. We don't need to await this as it doesn't block posting.
     client.invoke(new Api.account.UpdateStatus({ offline: true })).catch((e) => {
       console.warn(`Could not set status to offline for ${userId}:`, e.message);
     });
@@ -128,9 +130,6 @@ async function saveUserSettings(userId, privacy, duration) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Generates the scheduling inline keyboard with templates or main options.
- */
 function getSchedulingKeyboard(showTemplates = false) {
   if (showTemplates) {
     return {
@@ -159,9 +158,6 @@ function getSchedulingKeyboard(showTemplates = false) {
   };
 }
 
-/**
- * Download a file from a URL to a temp path.
- */
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https") ? https : http;
@@ -187,9 +183,6 @@ function downloadFile(url, destPath) {
   });
 }
 
-/**
- * Logic to handle actual scheduling via setTimeout
- */
 function handleScheduling(userId, delaySeconds, userPending, chatId, messageId = null) {
   const storyData = { ...userPending };
   pendingStories.delete(userId);
@@ -218,9 +211,6 @@ function handleScheduling(userId, delaySeconds, userPending, chatId, messageId =
   }, delaySeconds * 1000);
 }
 
-/**
- * Post media (photo or video) to the authenticated user's story.
- */
 async function postToStory(client, filePath, isVideo, caption = "", privacy, duration) {
   if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
     throw new Error("Temporary file is missing or empty. Please try again.");
@@ -360,12 +350,11 @@ bot.on("message", async (msg) => {
     } else if (state.step === "CODE") {
       const { client, phone, phoneCodeHash } = state;
       try {
-        // GramJS sign in authentication fix
         await client.invoke(
           new Api.auth.SignIn({
             phoneNumber: phone,
             phoneCodeHash: phoneCodeHash,
-            phoneCode: msg.text,
+            phoneCode: msg.text.trim(),
           })
         );
       } catch (err) {
@@ -378,11 +367,9 @@ bot.on("message", async (msg) => {
       finishLogin(userId, client);
 
     } else if (state.step === "2FA") {
-      const { client, phone, phoneCodeHash } = state;
-      // Get password info first to calculate the secure SRP cloud password hash
-      const passwordInfo = await client.invoke(new Api.account.GetPassword());
-      const passwordSRP = await client.start({
-        password: async () => msg.text,
+      const { client } = state;
+      await client.start({
+        password: async () => msg.text.trim(),
       });
       finishLogin(userId, client);
     }
@@ -735,8 +722,7 @@ bot.on("video", async (msg) => {
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start Engine ──────────────────────────────────────────────────────────────
 (async () => {
   await initDB();
-  console.log("🤖 Bot polling started. Users can now link accounts via /login.");
 })();
