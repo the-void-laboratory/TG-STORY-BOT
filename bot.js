@@ -77,7 +77,8 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-const activeClients = new Map(); // FIXED: Initialized missing global map for runtime user clients
+// Global runtime memory maps
+const activeClients = new Map(); 
 const pendingStories = new Map(); // Store pending stories per user ID
 const waitingForCaption = new Set(); // User IDs waiting to send a custom caption
 const waitingForCustomTime = new Set(); // User IDs waiting for custom minutes input
@@ -359,7 +360,14 @@ bot.on("message", async (msg) => {
     } else if (state.step === "CODE") {
       const { client, phone, phoneCodeHash } = state;
       try {
-        await client.signIn({ phoneNumber: phone, phoneCodeHash, phoneCode: msg.text });
+        // GramJS sign in authentication fix
+        await client.invoke(
+          new Api.auth.SignIn({
+            phoneNumber: phone,
+            phoneCodeHash: phoneCodeHash,
+            phoneCode: msg.text,
+          })
+        );
       } catch (err) {
         if (err.errorMessage === "SESSION_PASSWORD_NEEDED") {
           loginStates.set(userId, { ...state, step: "2FA" });
@@ -371,7 +379,11 @@ bot.on("message", async (msg) => {
 
     } else if (state.step === "2FA") {
       const { client, phone, phoneCodeHash } = state;
-      await client.signIn({ phoneNumber: phone, phoneCodeHash, password: msg.text });
+      // Get password info first to calculate the secure SRP cloud password hash
+      const passwordInfo = await client.invoke(new Api.account.GetPassword());
+      const passwordSRP = await client.start({
+        password: async () => msg.text,
+      });
       finishLogin(userId, client);
     }
   } catch (err) {
@@ -623,7 +635,6 @@ bot.on("callback_query", async (query) => {
       activeClients.delete(userId);
     }
 
-    // FIXED: Removed undefined reference error to userSessions
     await deleteSession(userId);
 
     await bot.answerCallbackQuery(query.id, { text: "Logging out..." });
