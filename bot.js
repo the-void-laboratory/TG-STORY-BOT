@@ -27,17 +27,17 @@ const OWNER_ID = parseInt(process.env.OWNER_ID, 10);
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!BOT_TOKEN || !API_ID || !API_HASH) {
-  console.error("❌ Missing BOT_TOKEN, API_ID, or API_HASH in .env");
+  console.error("❌  Missing BOT_TOKEN, API_ID, or API_HASH in .env");
   process.exit(1);
 }
 
-// ── Telegram Bot Initialisation ──────────────────────────────────────────────
+// ── Telegram Bot (node-telegram-bot-api) ──────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Handle unexpected polling errors gracefully without crashing the engine
+// Handle unexpected polling errors gracefully without breaking execution
 bot.on("polling_error", (error) => {
   if (error.message.includes("409 Conflict")) {
-    console.warn("⚠️ Dual polling conflict noticed. Another container instance is shutting down...");
+    console.warn("⚠️ Dual polling conflict noticed. Old container is spinning down...");
   } else {
     console.error("📋 Polling Error:", error.message);
   }
@@ -60,7 +60,7 @@ async function initDB() {
     console.log("✅ Connected to MongoDB");
   } catch (err) {
     console.error("❌ MongoDB Connection Error:", err.message);
-    console.warn("⚠️ Falling back to memory mode.");
+    console.warn("⚠️ Falling back to memory (non-persistent) mode.");
   }
 }
 
@@ -80,7 +80,7 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-// Global runtime maps
+// Global runtime maps (Explicit initialization)
 const activeClients = new Map(); 
 const pendingStories = new Map(); 
 const waitingForCaption = new Set(); 
@@ -343,11 +343,13 @@ bot.on("message", async (msg) => {
       const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
       await client.connect();
       
-      const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, msg.text);
-      loginStates.set(userId, { step: "CODE", client, phone: msg.text, phoneCodeHash });
-      bot.sendMessage(userId, "📬 Enter the code Telegram just sent you:");
+      const cleanPhone = msg.text.replace(/\s+/g, "");
+      const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, cleanPhone);
+      loginStates.set(userId, { step: "CODE", client, phone: cleanPhone, phoneCodeHash });
+      bot.sendMessage(userId, "📬 Enter the verification code Telegram just sent you:");
 
     } else if (state.step === "CODE") {
+      // FIX: Extracts and references the original initialization connection client 
       const { client, phone, phoneCodeHash } = state;
       try {
         await client.invoke(
@@ -368,6 +370,7 @@ bot.on("message", async (msg) => {
 
     } else if (state.step === "2FA") {
       const { client } = state;
+      // GramJS start utility seamlessly performs internal SRP generation securely for 2FA
       await client.start({
         password: async () => msg.text.trim(),
       });
@@ -722,7 +725,7 @@ bot.on("video", async (msg) => {
   }
 });
 
-// ── Start Engine ──────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 (async () => {
   await initDB();
 })();
