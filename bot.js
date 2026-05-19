@@ -125,7 +125,6 @@ const pendingStories = new Map(); // Store pending stories per user ID
 const waitingForCaption = new Set(); // User IDs waiting to send a custom caption
 const waitingForCustomTime = new Set(); // User IDs waiting for custom minutes input
 const userCooldowns = new Map(); // userId -> lastPostTimestamp (for cooldown)
-const activeClients = new Map(); // Store active GramJS clients
 const loginStates = new Map();   // Track login progress per user
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
