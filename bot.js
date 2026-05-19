@@ -77,8 +77,6 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-const activeClients = new Map(); // Store active GramJS clients
-const loginStates = new Map();   // Track login progress per user
 
 async function getClient(userId) {
   let client = activeClients.get(userId);
