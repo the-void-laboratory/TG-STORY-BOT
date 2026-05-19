@@ -122,13 +122,49 @@ async function saveUserSettings(userId, privacy, duration) {
 }
 
 const pendingStories = new Map(); // Store pending stories per user ID
+const waitingForCaption = new Set(); // User IDs waiting to send a custom caption
+const waitingForCustomTime = new Set(); // User IDs waiting for custom minutes input
 const userCooldowns = new Map(); // userId -> lastPostTimestamp (for cooldown)
+const activeClients = new Map(); // Store active GramJS clients
+const loginStates = new Map();   // Track login progress per user
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
+ * Generates the scheduling inline keyboard with templates or main options.
+ */
+function getSchedulingKeyboard(showTemplates = false) {
+  if (showTemplates) {
+    return {
+      inline_keyboard: [
+        [
+          { text: "15m", callback_data: "sched_900" },
+          { text: "30m", callback_data: "sched_1800" },
+          { text: "1h", callback_data: "sched_3600" }
+        ],
+        [
+          { text: "3h", callback_data: "sched_10800" },
+          { text: "6h", callback_data: "sched_21600" },
+          { text: "12h", callback_data: "sched_43200" }
+        ],
+        [{ text: "⬅️ Back", callback_data: "sched_main_menu" }]
+      ]
+    };
+  }
+  return {
+    inline_keyboard: [
+      [{ text: "🚀 Post Now", callback_data: "sched_now" }],
+      [{ text: "📋 Templates", callback_data: "sched_templates" }, { text: "📅 Custom", callback_data: "sched_custom" }],
+      [{ text: "✏️ Edit Caption", callback_data: "sched_edit_caption" }],
+      [{ text: "❌ Cancel", callback_data: "sched_cancel" }],
+    ],
+  };
+}
+
+/**
  * Download a file from a URL to a temp path.
  */
+
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https") ? https : http;
@@ -152,6 +188,37 @@ function downloadFile(url, destPath) {
       reject(err);
     });
   });
+}
+
+/**
+ * Logic to handle actual scheduling via setTimeout
+ */
+function handleScheduling(userId, delaySeconds, userPending, chatId, messageId = null) {
+  const storyData = { ...userPending };
+  pendingStories.delete(userId);
+  userCooldowns.set(userId, Date.now());
+
+  const text = delaySeconds === 0 ? "🚀 Posting now..." : `✅ Scheduled for ${Math.floor(delaySeconds / 60)}m from now.`;
+  
+  if (messageId) {
+    bot.editMessageText(text, { chat_id: chatId, message_id: messageId });
+  } else {
+    bot.sendMessage(chatId, text);
+  }
+
+  setTimeout(async () => {
+    try {
+      const client = await getClient(userId);
+      const settings = await loadUserSettings(userId);
+      await postToStory(client, storyData.filePath, storyData.isVideo, storyData.caption, settings.currentPrivacy, settings.currentDuration);
+      bot.sendMessage(userId, "✅ Your story has been posted!");
+    } catch (err) {
+      console.error("Scheduled post error:", err);
+      bot.sendMessage(userId, `❌ Scheduled post failed: ${err.message}`);
+    } finally {
+      if (fs.existsSync(storyData.filePath)) fs.unlinkSync(storyData.filePath);
+    }
+  }, delaySeconds * 1000);
 }
 
 /**
