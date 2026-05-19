@@ -1,0 +1,23 @@
+{
+  "name": "tg-story-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that posts photos and videos to your story via MTProto",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "setup": "node setup.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "input": "^1.0.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "telegram": "^2.26.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
