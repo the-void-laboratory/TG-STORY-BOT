@@ -81,22 +81,27 @@ const activeClients = new Map(); // Store active GramJS clients
 const loginStates = new Map();   // Track login progress per user
 
 async function getClient(userId) {
-  if (activeClients.has(userId)) return activeClients.get(userId);
+  let client = activeClients.get(userId);
 
-  const sessionStr = await getSessionStr(userId);
-  if (!sessionStr) return null;
+  if (!client) {
+    const sessionStr = await getSessionStr(userId);
+    if (!sessionStr) return null;
 
-  const client = new TelegramClient(new StringSession(sessionStr), API_ID, API_HASH, { 
-    connectionRetries: 5,
-  });
-
-  await client.connect();
-  if (await client.isUserAuthorized()) {
-    // Set user status to offline so the account doesn't appear "Online" 
-    // while the bot is running.
-    await client.invoke(new Api.account.UpdateStatus({ offline: true }));
-    
+    client = new TelegramClient(new StringSession(sessionStr), API_ID, API_HASH, { 
+      connectionRetries: 5,
+    });
+    await client.connect();
     activeClients.set(userId, client);
+  }
+
+  if (await client.isUserAuthorized()) {
+    try {
+      // Re-assert offline status every time the client is retrieved
+      // This ensures the bot session stays "invisible" to others.
+      await client.invoke(new Api.account.UpdateStatus({ offline: true }));
+    } catch (e) {
+      console.warn(`Could not set status to offline for ${userId}:`, e.message);
+    }
     return client;
   }
   return null;
