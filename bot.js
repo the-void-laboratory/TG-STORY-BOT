@@ -95,13 +95,10 @@ async function getClient(userId) {
   }
 
   if (await client.isUserAuthorized()) {
-    try {
-      // Re-assert offline status every time the client is retrieved
-      // This ensures the bot session stays "invisible" to others.
-      await client.invoke(new Api.account.UpdateStatus({ offline: true }));
-    } catch (e) {
+    // Re-assert offline status. We don't need to await this as it doesn't block posting.
+    client.invoke(new Api.account.UpdateStatus({ offline: true })).catch((e) => {
       console.warn(`Could not set status to offline for ${userId}:`, e.message);
-    }
+    });
     return client;
   }
   return null;
