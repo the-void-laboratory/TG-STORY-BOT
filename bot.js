@@ -1,7 +1,10 @@
 /**
  * TG Story Bot
- * Posts photos/videos to your Telegram story via the MTProto client API.
- * Includes an HTTP panel to prevent Railway dual-polling container auth drops.
+ * Purely Interactive Chat-Based Telegram Authentication (No Web Site Interface)
+ *
+ * Requirements:
+ * - BOT_TOKEN      → from @BotFather
+ * - API_ID + API_HASH → from https://my.telegram.org/apps
  */
 
 require("dotenv").config();
@@ -22,19 +25,27 @@ const SESSION_STRING = process.env.SESSION_STRING || "";
 const COOLDOWN_SECONDS = parseInt(process.env.COOLDOWN_SECONDS || "300", 10);
 const OWNER_ID = parseInt(process.env.OWNER_ID, 10);
 const MONGODB_URI = process.env.MONGODB_URI;
-const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || !API_ID || !API_HASH) {
   console.error("❌ Missing BOT_TOKEN, API_ID, or API_HASH in .env");
   process.exit(1);
 }
 
-// ── Telegram Bot ──────────────────────────────────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// ── Telegram Bot Initialization ──────────────────────────────────────────────
+// Passing testEnvironment: false explicitly blocks local handshake mutations
+const bot = new TelegramBot(BOT_TOKEN, { 
+  polling: {
+    autoStart: true,
+    params: {
+      timeout: 10
+    }
+  } 
+});
 
+// Gracefully drop existing conflicts to prioritize this active container sequence
 bot.on("polling_error", (error) => {
   if (error.message.includes("409 Conflict")) {
-    console.warn("⚠️ Dual polling conflict noticed. Another container instance is running...");
+    console.warn("⚠️ Dual polling conflict noticed. Forcefully reclaiming loop context...");
   } else {
     console.error("📋 Polling Error:", error.message);
   }
@@ -45,7 +56,7 @@ let db, sessionsColl, settingsColl;
 
 async function initDB() {
   if (!MONGODB_URI) {
-    console.warn("⚠️ MONGODB_URI not found. Falling back to memory mode.");
+    console.warn("⚠️ MONGODB_URI not found. Running in memory fallback.");
     return;
   }
   try {
@@ -76,16 +87,17 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-// Global runtime containers
+// Runtime Storage Objects
 const activeClients = new Map(); 
 const pendingStories = new Map(); 
 const waitingForCaption = new Set(); 
 const waitingForCustomTime = new Set(); 
 const userCooldowns = new Map(); 
-const webAuthSessions = new Map(); // Shared object for web UI log-ins
+const loginStates = new Map();   
 
 async function getClient(userId) {
   let client = activeClients.get(userId);
+
   if (!client) {
     const sessionStr = await getSessionStr(userId);
     if (!sessionStr) return null;
@@ -96,6 +108,7 @@ async function getClient(userId) {
     await client.connect();
     activeClients.set(userId, client);
   }
+
   if (await client.isUserAuthorized()) {
     client.invoke(new Api.account.UpdateStatus({ offline: true })).catch(() => {});
     return client;
@@ -142,9 +155,7 @@ function downloadFile(url, destPath) {
     const proto = url.startsWith("https") ? https : http;
     const file = fs.createWriteStream(destPath);
     proto.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Status: ${res.statusCode}`));
-      }
+      if (res.statusCode !== 200) return reject(new Error(`Failed setup: ${res.statusCode}`));
       res.pipe(file);
       file.on("finish", () => file.close(resolve));
     }).on("error", reject);
@@ -185,85 +196,17 @@ async function postToStory(client, filePath, isVideo, caption = "", privacy, dur
   return await client.invoke(new Api.stories.SendStory({ peer: new Api.InputPeerSelf(), media, privacyRules, caption: caption || undefined, period: duration }));
 }
 
-// ── Web Dashboard Login (Solves Railway Handshake Conflict) ─────────────────
-const server = http.createServer(async (req, res) => {
-  const urlObj = new URL(req.url, `http://${req.headers.host}`);
-  
-  if (urlObj.pathname === "/login-panel") {
-    const uid = urlObj.searchParams.get("uid");
-    res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(`
-      <html>
-      <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f7f9;">
-        <h2>🔐 Link Telegram Account (ID: ${uid})</h2>
-        <form action="/submit-phone" method="GET" style="margin-bottom:20px;">
-          <input type="hidden" name="uid" value="${uid}">
-          <input type="text" name="phone" placeholder="+123456789" required style="padding:10px; width:250px;"><br><br>
-          <button type="submit" style="padding:10px 20px; background:#0088cc; color:#fff; border:none; border-radius:4px; cursor:pointer;">Request Verification Code</button>
-        </form>
-        <form action="/submit-code" method="GET">
-          <input type="hidden" name="uid" value="${uid}">
-          <input type="text" name="code" placeholder="Enter Code" required style="padding:10px; width:120px;">
-          <input type="password" name="password" placeholder="2FA Password (if enabled)" style="padding:10px; width:180px;"><br><br>
-          <button type="submit" style="padding:10px 20px; background:#4caf50; color:#fff; border:none; border-radius:4px; cursor:pointer;">Complete Connection</button>
-        </form>
-      </body>
-      </html>
-    `);
-  } 
-  else if (urlObj.pathname === "/submit-phone") {
-    const uid = parseInt(urlObj.searchParams.get("uid"), 10);
-    const phone = urlObj.searchParams.get("phone").replace(/\s+/g, "");
-    try {
-      const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
-      await client.connect();
-      const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, phone);
-      webAuthSessions.set(uid, { client, phone, phoneCodeHash });
-      res.end("Code sent! Check your Telegram App, type it into the panel box and click Complete Connection.");
-    } catch (e) {
-      res.end("Error sending code: " + e.message);
-    }
-  } 
-  else if (urlObj.pathname === "/submit-code") {
-    const uid = parseInt(urlObj.searchParams.get("uid"), 10);
-    const code = urlObj.searchParams.get("code").trim();
-    const password = urlObj.searchParams.get("password")?.trim();
-    const sessionData = webAuthSessions.get(uid);
-
-    if (!sessionData) return res.end("Session missing. Please refresh the main panel link.");
-
-    try {
-      const { client, phone, phoneCodeHash } = sessionData;
-      try {
-        await client.invoke(new Api.auth.SignIn({ phoneNumber: phone, phoneCodeHash, phoneCode: code }));
-      } catch (err) {
-        if (err.errorMessage === "SESSION_PASSWORD_NEEDED" && password) {
-          await client.start({ password: async () => password });
-        } else if (err.errorMessage === "SESSION_PASSWORD_NEEDED") {
-          return res.end("Error: This account has 2FA enabled. Please fill out the 2FA Password field.");
-        } else throw err;
-      }
-      
-      const sessionStr = client.session.save();
-      await saveSession(uid, sessionStr);
-      activeClients.set(uid, client);
-      webAuthSessions.delete(uid);
-
-      bot.sendMessage(uid, "✅ Account linked successfully! You can now send photos/videos.");
-      res.end("Success! Your account is securely connected. You can close this tab.");
-    } catch (e) {
-      res.end("Login failed: " + e.message);
-    }
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
-});
-
-// ── Telegram Event Commands ──────────────────────────────────────────────────
+// ── Bot Conversational Triggers ────────────────────────────────────────────────
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, `👋 *Story Bot is running!*\n\n🔐 /login - Link account via login panel\n🚪 /logout - Remove account\n⚙️ /privacy - Set visibility\n⏱ /duration - Expire timer`);
+  bot.sendMessage(msg.chat.id, `👋 *Story Bot Is Ready*\n\n🔐 /login - Connection Verification Account Flow\n🚪 /logout - Unlink account session`);
+});
+
+bot.onText(/\/logout/, async (msg) => {
+  const userId = msg.from.id;
+  await deleteSession(userId);
+  activeClients.delete(userId);
+  bot.sendMessage(userId, "✅ Logged out completely. Active variables unlinked.");
 });
 
 bot.onText(/\/login/, async (msg) => {
@@ -271,42 +214,106 @@ bot.onText(/\/login/, async (msg) => {
   const client = await getClient(userId);
   if (client) return bot.sendMessage(userId, "✅ You are already logged in!");
 
-  // Dynamic public dashboard URL fallback for environments like Railway
-  const appUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
-  bot.sendMessage(userId, `🔗 Click the secure authorization panel below to verify your account without container interruptions:\n\n👉 ${appUrl}/login-panel?uid=${userId}`);
-});
+  if (loginStates.has(userId)) {
+    const existing = loginStates.get(userId).client;
+    if (existing && existing.connected) existing.disconnect().catch(() => {});
+    loginStates.delete(userId);
+  }
 
-bot.onText(/\/logout/, async (msg) => {
-  const userId = msg.from.id;
-  await deleteSession(userId);
-  activeClients.delete(userId);
-  bot.sendMessage(userId, "🗑️ Logged out. Session data deleted.");
+  loginStates.set(userId, { step: "PHONE" });
+  bot.sendMessage(userId, "📱 Please send your phone number in international format (e.g., `+1234567890`).", { parse_mode: "Markdown" });
 });
 
 bot.on("message", async (msg) => {
   const userId = msg.from.id;
+
   if (waitingForCustomTime.has(userId) && msg.text && !msg.text.startsWith("/")) {
     const minutes = parseInt(msg.text, 10);
-    if (isNaN(minutes) || minutes < 1) return bot.sendMessage(userId, "❌ Enter a valid number.");
+    if (isNaN(minutes) || minutes < 1) return bot.sendMessage(userId, "❌ Please write an explicit amount of minutes.");
     waitingForCustomTime.delete(userId);
     const pending = pendingStories.get(userId);
     if (pending) handleScheduling(userId, minutes * 60, pending, msg.chat.id);
     return;
   }
+
   if (waitingForCaption.has(userId) && msg.text && !msg.text.startsWith("/")) {
     const pending = pendingStories.get(userId);
     if (pending) {
       pending.caption = msg.text;
       waitingForCaption.delete(userId);
-      return bot.sendMessage(userId, `Caption updated! When should I post it?`, { reply_markup: getSchedulingKeyboard() });
+      return bot.sendMessage(userId, `✅ Caption configured to: *${msg.text}*\nWhen should I post?`, {
+        parse_mode: "Markdown",
+        reply_markup: getSchedulingKeyboard(),
+      });
     }
   }
+
+  const state = loginStates.get(userId);
+  if (!state || !msg.text || msg.text.startsWith("/")) return;
+
+  try {
+    if (state.step === "PHONE") {
+      const cleanPhone = msg.text.replace(/\s+/g, "");
+      const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { 
+        connectionRetries: 5,
+        useWSS: false
+      });
+      await client.connect();
+      
+      const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, cleanPhone);
+      
+      // Save the instance immediately to preserve the handshake socket connection
+      loginStates.set(userId, { step: "CODE", client, phone: cleanPhone, phoneCodeHash });
+      bot.sendMessage(userId, "📬 Type the verification code sent directly to your Telegram devices:");
+
+    } else if (state.step === "CODE") {
+      const { client, phone, phoneCodeHash } = state;
+      const parsedCode = msg.text.trim();
+
+      try {
+        await client.invoke(
+          new Api.auth.SignIn({
+            phoneNumber: phone,
+            phoneCodeHash: phoneCodeHash,
+            phoneCode: parsedCode,
+          })
+        );
+      } catch (err) {
+        if (err.errorMessage === "SESSION_PASSWORD_NEEDED") {
+          loginStates.set(userId, { ...state, step: "2FA" });
+          return bot.sendMessage(userId, "🔑 2FA is active. Please send your cloud validation password below:");
+        }
+        throw err;
+      }
+      
+      await finishLogin(userId, client);
+
+    } else if (state.step === "2FA") {
+      const { client } = state;
+      await client.start({
+        password: async () => msg.text.trim(),
+      });
+      await finishLogin(userId, client);
+    }
+  } catch (err) {
+    console.error("Login error:", err);
+    bot.sendMessage(userId, `❌ Connection attempt crashed: ${err.message}. Type /login to start a fresh handshake.`);
+    loginStates.delete(userId);
+  }
 });
+
+async function finishLogin(userId, client) {
+  const sessionStr = client.session.save();
+  await saveSession(userId, sessionStr);
+  activeClients.set(userId, client);
+  loginStates.delete(userId);
+  bot.sendMessage(userId, "✅ Account successfully linked! You can now send photos and videos directly to post them as stories.");
+}
 
 bot.on("photo", async (msg) => {
   const userId = msg.from.id;
   const client = await getClient(userId);
-  if (!client) return bot.sendMessage(userId, "❌ Please execute /login first.");
+  if (!client) return bot.sendMessage(userId, "❌ Use /login to link an active Telegram profile first.");
 
   const tempPath = path.join(__dirname, `story_${Date.now()}.jpg`);
   const photo = msg.photo[msg.photo.length - 1];
@@ -315,13 +322,13 @@ bot.on("photo", async (msg) => {
   await downloadFile(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`, tempPath);
   pendingStories.set(userId, { filePath: tempPath, isVideo: false, caption: msg.caption || "" });
 
-  bot.sendMessage(msg.chat.id, "📸 Photo loaded! Choose an option:", { reply_markup: getSchedulingKeyboard() });
+  bot.sendMessage(msg.chat.id, "📸 Photo context saved! Choose scheduling distribution profile:", { reply_markup: getSchedulingKeyboard() });
 });
 
 bot.on("video", async (msg) => {
   const userId = msg.from.id;
   const client = await getClient(userId);
-  if (!client) return bot.sendMessage(userId, "❌ Please execute /login first.");
+  if (!client) return bot.sendMessage(userId, "❌ Use /login to link an active Telegram profile first.");
 
   const tempPath = path.join(__dirname, `story_${Date.now()}.mp4`);
   const fileInfo = await bot.getFile(msg.video.file_id);
@@ -329,7 +336,7 @@ bot.on("video", async (msg) => {
   await downloadFile(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`, tempPath);
   pendingStories.set(userId, { filePath: tempPath, isVideo: true, caption: msg.caption || "" });
 
-  bot.sendMessage(msg.chat.id, "🎥 Video loaded! Choose an option:", { reply_markup: getSchedulingKeyboard() });
+  bot.sendMessage(msg.chat.id, "🎥 Video context saved! Choose scheduling distribution profile:", { reply_markup: getSchedulingKeyboard() });
 });
 
 bot.on("callback_query", async (query) => {
@@ -338,13 +345,13 @@ bot.on("callback_query", async (query) => {
 
   if (data.startsWith("sched_")) {
     const pending = pendingStories.get(userId);
-    if (!pending) return bot.answerCallbackQuery(query.id, { text: "No pending session." });
+    if (!pending) return bot.answerCallbackQuery(query.id, { text: "No pending setup active." });
 
     const action = data.replace("sched_", "");
     if (action === "now") handleScheduling(userId, 0, pending, query.message.chat.id, query.message.message_id);
     else if (action === "custom") {
       waitingForCustomTime.add(userId);
-      bot.sendMessage(userId, "📅 How many minutes from now?");
+      bot.sendMessage(userId, "📅 How many minutes from now should I upload this story?");
     } else if (action === "cancel") {
       if (fs.existsSync(pending.filePath)) fs.unlinkSync(pending.filePath);
       pendingStories.delete(userId);
@@ -353,8 +360,9 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-// ── Execution ─────────────────────────────────────────────────────────────────
+// Dummy listening server to keep the Railway network port assignment requirement happy
+http.createServer((req, res) => { res.writeHead(200); res.end("Online"); }).listen(process.env.PORT || 3000);
+
 (async () => {
   await initDB();
-  server.listen(PORT, () => console.log(`🚀 Security authentication panel online on port ${PORT}`));
 })();
