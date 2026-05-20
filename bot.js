@@ -86,7 +86,7 @@ async function deleteSession(userId) {
   await sessionsColl.deleteOne({ userId });
 }
 
-// Global runtime maps (FIX: Added explicit initializations so getClient doesn't crash)
+// Global runtime maps
 const activeClients = new Map();
 const pendingStories = new Map(); // Store pending stories per user ID
 const waitingForCaption = new Set(); // User IDs waiting to send a custom caption
@@ -109,7 +109,6 @@ async function getClient(userId) {
   }
 
   if (await client.isUserAuthorized()) {
-    // Re-assert offline status. We don't need to await this as it doesn't block posting.
     client.invoke(new Api.account.UpdateStatus({ offline: true })).catch((e) => {
       console.warn(`Could not set status to offline for ${userId}:`, e.message);
     });
@@ -231,18 +230,15 @@ function handleScheduling(userId, delaySeconds, userPending, chatId, messageId =
  * Post media (photo or video) to the authenticated user's story.
  */
 async function postToStory(client, filePath, isVideo, caption = "", privacy, duration) {
-  // Verify file availability and size
   if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
     throw new Error("Temporary file is missing or empty. Please try again.");
   }
 
-  // Upload the file via GramJS
   const uploadedFile = await client.uploadFile({ 
     file: filePath,
     workers: 4,
   });
 
-  // Build media object
   let media;
   if (isVideo) {
     media = new Api.InputMediaUploadedDocument({
@@ -261,7 +257,6 @@ async function postToStory(client, filePath, isVideo, caption = "", privacy, dur
     });
   }
 
-  // Determine privacy based on user settings
   let privacyRules;
   if (privacy === "contacts") {
     privacyRules = [new Api.InputPrivacyValueAllowContacts()];
@@ -319,7 +314,6 @@ bot.onText(/\/login/, async (msg) => {
   const client = await getClient(userId);
   if (client) return bot.sendMessage(userId, "✅ You are already logged in!");
 
-  // If a login process was ongoing, cancel it to start fresh.
   if (loginStates.has(userId)) {
     const currentClient = loginStates.get(userId).client;
     if (currentClient && currentClient.connected) currentClient.disconnect();
@@ -366,46 +360,55 @@ bot.on("message", async (msg) => {
 
   try {
     if (state.step === "PHONE") {
+      const cleanPhone = msg.text.replace(/\s+/g, "");
       const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
       await client.connect();
-      
-      const cleanPhone = msg.text.replace(/\s+/g, "");
-      const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, cleanPhone);
-      loginStates.set(userId, { step: "CODE", client, phone: cleanPhone, phoneCodeHash });
+
+      // Setup deferred promise placeholders so client.start can asynchronously receive parameters via chat updates
+      let resolveCode, resolvePassword;
+      const codePromise = new Promise((resolve) => { resolveCode = resolve; });
+      const passwordPromise = new Promise((resolve) => { resolvePassword = resolve; });
+
+      // Trigger the background execution loop using GramJS's robust auth lifecycle
+      client.start({
+        phoneNumber: async () => cleanPhone,
+        phoneCode: async () => await codePromise,
+        password: async () => await passwordPromise,
+        onError: (err) => { throw err; }
+      }).then(async () => {
+        await finishLogin(userId, client);
+      }).catch((err) => {
+        console.error("Async login internal error:", err);
+        bot.sendMessage(userId, `❌ Login process broken: ${err.message}`);
+        loginStates.delete(userId);
+      });
+
+      loginStates.set(userId, { step: "CODE", client, resolveCode, resolvePassword });
       bot.sendMessage(userId, "📬 Enter the code Telegram just sent you:");
 
     } else if (state.step === "CODE") {
-      const { client, phone, phoneCodeHash } = state;
-      const cleanCode = msg.text.trim();
-      try {
-        // FIX: Replaced client.signIn with client.invoke(Api.auth.SignIn) to prevent socket/handshake reset
-        await client.invoke(
-          new Api.auth.SignIn({
-            phoneNumber: phone,
-            phoneCodeHash: phoneCodeHash,
-            phoneCode: cleanCode,
-          })
-        );
-      } catch (err) {
-        if (err.errorMessage === "SESSION_PASSWORD_NEEDED") {
-          loginStates.set(userId, { ...state, step: "2FA" });
-          return bot.sendMessage(userId, "🔑 2FA is enabled. Please enter your cloud password:");
-        }
-        throw err;
-      }
-      finishLogin(userId, client);
+      const { resolveCode } = state;
+      loginStates.set(userId, { ...state, step: "2FA_CHECK" });
+      
+      // Send code response directly to GramJS promise holder
+      resolveCode(msg.text.trim());
 
-    } else if (state.step === "2FA") {
-      const { client } = state;
-      // FIX: Secure internal processing wrapper for cloud dynamic passwords
-      await client.start({
-        password: async () => msg.text.trim(),
-      });
-      finishLogin(userId, client);
+      // Give the background execution engine time to evaluate if a 2FA prompt is needed
+      setTimeout(() => {
+        const currentState = loginStates.get(userId);
+        if (currentState && currentState.step === "2FA_CHECK") {
+          loginStates.set(userId, { ...currentState, step: "2FA" });
+          bot.sendMessage(userId, "🔑 2FA is enabled. Please enter your cloud password:");
+        }
+      }, 2500);
+
+    } else if (state.step === "2FA" || state.step === "2FA_CHECK") {
+      const { resolvePassword } = state;
+      resolvePassword(msg.text.trim());
     }
   } catch (err) {
-    console.error("Login error:", err);
-    bot.sendMessage(userId, `❌ Login failed: ${err.message}. Use /login to try again.`);
+    console.error("Login initialization setup error:", err);
+    bot.sendMessage(userId, `❌ Setup initialization failed: ${err.message}. Use /login to try again.`);
     loginStates.delete(userId);
   }
 });
@@ -424,14 +427,11 @@ bot.onText(/\/status/, async (msg) => {
   bot.sendMessage(msg.chat.id, connected ? "✅ Client connected." : "❌ Client disconnected. Restart the bot.");
 });
 
-// ── Backup Command (Owner Only) ──────────────────────────────────────────────
-// Note: With MongoDB, you should use mongodump or Railway's backup tools.
 bot.onText(/\/backup/, (msg) => {
   if (msg.from.id !== OWNER_ID) return;
   bot.sendMessage(msg.chat.id, "💾 Data is now stored in MongoDB. Use Railway dashboard for backups.");
 });
 
-// Privacy Menu
 bot.onText(/\/privacy/, async (msg) => {
   const userId = msg.from.id;
   const session = await getSessionStr(userId);
@@ -456,7 +456,6 @@ bot.onText(/\/privacy/, async (msg) => {
   );
 });
 
-// Duration Menu
 bot.onText(/\/duration/, async (msg) => {
   const userId = msg.from.id;
   const session = await getSessionStr(userId);
@@ -486,14 +485,12 @@ bot.onText(/\/duration/, async (msg) => {
   );
 });
 
-// List Active Stories
 bot.onText(/\/list/, async (msg) => {
   const client = await getClient(msg.from.id);
   if (!client) return bot.sendMessage(msg.from.id, "❌ Link your account first with /login");
   await sendStoryList(client, msg.chat.id);
 });
 
-// Helper function to fetch and send/edit the story list
 async function sendStoryList(client, chatId, messageId = null) {
   try {
     if (!client) return;
@@ -504,7 +501,6 @@ async function sendStoryList(client, chatId, messageId = null) {
       })
     );
 
-    // result.stories is the PeerStories object, which has a stories array
     const storiesList = result.stories?.stories || [];
     const activeStories = storiesList.filter(s => s.className === "StoryItem");
 
@@ -551,8 +547,7 @@ async function sendStoryList(client, chatId, messageId = null) {
   }
 }
 
-// Handle menu interactions
-bot.on("callback_query", async (query) => { // Made async to handle API calls
+bot.on("callback_query", async (query) => {
   const data = query.data;
   const userId = query.from.id;
   const isOwner = OWNER_ID && userId === OWNER_ID;
@@ -626,7 +621,7 @@ bot.on("callback_query", async (query) => { // Made async to handle API calls
 
     const delaySeconds = action === "now" ? 0 : parseInt(action, 10);
     handleScheduling(userId, delaySeconds, userPending, query.message.chat.id, query.message.message_id);
-  } else if (data.startsWith("delete_story_")) { // Owner-only
+  } else if (data.startsWith("delete_story_")) {
     if (!isOwner) return bot.answerCallbackQuery(query.id, { text: "⛔ Owner only." });
 
     const storyId = parseInt(data.replace("delete_story_", ""), 10);
@@ -648,7 +643,6 @@ bot.on("callback_query", async (query) => { // Made async to handle API calls
       bot.answerCallbackQuery(query.id, { text: `❌ Failed to delete story: ${err.message}` });
     }
   } else if (data === "logout_confirm_yes") {
-    const userId = query.from.id;
     const messageId = query.message.message_id;
 
     const client = activeClients.get(userId);
@@ -661,7 +655,6 @@ bot.on("callback_query", async (query) => { // Made async to handle API calls
       activeClients.delete(userId);
     }
 
-    // FIX: Removed the broken undefined reference mutation call
     await deleteSession(userId);
 
     await bot.answerCallbackQuery(query.id, { text: "Logging out..." });
@@ -671,7 +664,6 @@ bot.on("callback_query", async (query) => { // Made async to handle API calls
       parse_mode: "Markdown"
     });
   } else if (data === "logout_confirm_no") {
-    const userId = query.from.id;
     const messageId = query.message.message_id;
 
     await bot.answerCallbackQuery(query.id, { text: "Logout cancelled." });
@@ -684,7 +676,7 @@ bot.on("callback_query", async (query) => { // Made async to handle API calls
 });
 
 // Handle photos
-bot.on("photo", async (msg) => { // Public access
+bot.on("photo", async (msg) => {
   const userId = msg.from.id;
   waitingForCaption.delete(userId);
 
@@ -722,7 +714,7 @@ bot.on("photo", async (msg) => { // Public access
 });
 
 // Handle videos
-bot.on("video", async (msg) => { // Public access
+bot.on("video", async (msg) => {
   const userId = msg.from.id;
   waitingForCaption.delete(userId);
 
@@ -744,7 +736,6 @@ bot.on("video", async (msg) => { // Public access
   try {
     const fileInfo = await bot.getFile(msg.video.file_id);
 
-    // Bot API has a 20MB download limit
     if (msg.video.file_size > 20 * 1024 * 1024) {
       throw new Error("Video exceeds 20MB Bot API limit. Please compress and retry.");
     }
