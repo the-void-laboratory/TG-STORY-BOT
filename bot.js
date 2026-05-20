@@ -137,6 +137,36 @@ async function saveUserSettings(userId, privacy, duration) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
+ * Inline keypad numeric entry matrix helper
+ */
+function getNumericPadKeyboard(currentBuffer = "") {
+  return {
+    inline_keyboard: [
+      [
+        { text: "1", callback_data: "num_1" },
+        { text: "2", callback_data: "num_2" },
+        { text: "3", callback_data: "num_3" }
+      ],
+      [
+        { text: "4", callback_data: "num_4" },
+        { text: "5", callback_data: "num_5" },
+        { text: "6", callback_data: "num_6" }
+      ],
+      [
+        { text: "7", callback_data: "num_7" },
+        { text: "8", callback_data: "num_8" },
+        { text: "9", callback_data: "num_9" }
+      ],
+      [
+        { text: "⌫ Clear", callback_data: "num_clear" },
+        { text: "0", callback_data: "num_0" },
+        { text: "🚀 Submit", callback_data: "num_submit" }
+      ]
+    ]
+  };
+}
+
+/**
  * Generates the scheduling inline keyboard with templates or main options.
  */
 function getSchedulingKeyboard(showTemplates = false) {
@@ -364,12 +394,10 @@ bot.on("message", async (msg) => {
       const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
       await client.connect();
 
-      // Setup deferred promise placeholders so client.start can asynchronously receive parameters via chat updates
       let resolveCode, resolvePassword;
       const codePromise = new Promise((resolve) => { resolveCode = resolve; });
       const passwordPromise = new Promise((resolve) => { resolvePassword = resolve; });
 
-      // Trigger the background execution loop using GramJS's robust auth lifecycle
       client.start({
         phoneNumber: async () => cleanPhone,
         phoneCode: async () => await codePromise,
@@ -383,28 +411,18 @@ bot.on("message", async (msg) => {
         loginStates.delete(userId);
       });
 
-      loginStates.set(userId, { step: "CODE", client, resolveCode, resolvePassword });
-      bot.sendMessage(userId, "📬 Enter the code Telegram just sent you:");
+      loginStates.set(userId, { 
+        step: "CODE", 
+        client, 
+        resolveCode, 
+        resolvePassword,
+        codeBuffer: "" 
+      });
 
-    } else if (state.step === "CODE") {
-      const { resolveCode } = state;
-      loginStates.set(userId, { ...state, step: "2FA_CHECK" });
-      
-      // Send code response directly to GramJS promise holder
-      resolveCode(msg.text.trim());
-
-      // Give the background execution engine time to evaluate if a 2FA prompt is needed
-      setTimeout(() => {
-        const currentState = loginStates.get(userId);
-        if (currentState && currentState.step === "2FA_CHECK") {
-          loginStates.set(userId, { ...currentState, step: "2FA" });
-          bot.sendMessage(userId, "🔑 2FA is enabled. Please enter your cloud password:");
-        }
-      }, 2500);
-
-    } else if (state.step === "2FA" || state.step === "2FA_CHECK") {
-      const { resolvePassword } = state;
-      resolvePassword(msg.text.trim());
+      bot.sendMessage(userId, "📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: `(empty)`", {
+        parse_mode: "Markdown",
+        reply_markup: getNumericPadKeyboard("")
+      });
     }
   } catch (err) {
     console.error("Login initialization setup error:", err);
@@ -551,6 +569,64 @@ bot.on("callback_query", async (query) => {
   const data = query.data;
   const userId = query.from.id;
   const isOwner = OWNER_ID && userId === OWNER_ID;
+
+  // ── Handle Pad Interface Matrix ───────────────────────────────────────────
+  if (data.startsWith("num_")) {
+    const state = loginStates.get(userId);
+    if (!state) return bot.answerCallbackQuery(query.id, { text: "No active login sequence." });
+
+    const key = data.replace("num_", "");
+
+    if (key === "clear") {
+      state.codeBuffer = "";
+      bot.answerCallbackQuery(query.id, { text: "Cleared" });
+      bot.editMessageText(`📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: \`(empty)\``, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: "Markdown",
+        reply_markup: getNumericPadKeyboard("")
+      });
+      return;
+    }
+
+    if (key === "submit") {
+      if (!state.codeBuffer) return bot.answerCallbackQuery(query.id, { text: "Please enter a code first!" });
+      bot.answerCallbackQuery(query.id, { text: "Submitting..." });
+      
+      const submittedCode = state.codeBuffer;
+      
+      if (state.step === "CODE") {
+        loginStates.set(userId, { ...state, step: "2FA_CHECK", codeBuffer: "" });
+        state.resolveCode(submittedCode);
+
+        setTimeout(() => {
+          const currentState = loginStates.get(userId);
+          if (currentState && currentState.step === "2FA_CHECK") {
+            loginStates.set(userId, { ...currentState, step: "2FA", codeBuffer: "" });
+            bot.sendMessage(userId, "🔑 2FA is enabled. Use the keypad matrix to enter your custom password or 2FA code digits:");
+          }
+        }, 2000);
+      } else if (state.step === "2FA" || state.step === "2FA_CHECK") {
+        state.resolvePassword(submittedCode);
+      }
+      return;
+    }
+
+    // Append number
+    state.codeBuffer += key;
+    bot.answerCallbackQuery(query.id);
+    
+    // Obfuscate character array display matching industry metrics
+    const maskedText = "*".repeat(state.codeBuffer.length);
+
+    bot.editMessageText(`📬 Click the buttons below to enter the verification code sent by Telegram:\n\nEntered: \`${maskedText}\``, {
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      parse_mode: "Markdown",
+      reply_markup: getNumericPadKeyboard(state.codeBuffer)
+    });
+    return;
+  }
 
   if (data.startsWith("set_privacy_")) {
     const newPrivacy = data.replace("set_privacy_", "");
@@ -719,7 +795,7 @@ bot.on("video", async (msg) => {
   waitingForCaption.delete(userId);
 
   const client = await getClient(userId);
-  if (!client) return bot.sendMessage(userId, "❌ You must link your Telegram account first!! Use /login.");
+  if (!client) return bot.sendMessage(userId, "❌ You must link your Telegram account first! Use /login.");
 
   const lastPostTime = userCooldowns.get(userId);
   if (lastPostTime) {
