@@ -719,7 +719,7 @@ bot.on("video", async (msg) => {
   waitingForCaption.delete(userId);
 
   const client = await getClient(userId);
-  if (!client) return bot.sendMessage(userId, "❌ You must link your Telegram account first! Use /login.");
+  if (!client) return bot.sendMessage(userId, "❌ You must link your Telegram account first!! Use /login.");
 
   const lastPostTime = userCooldowns.get(userId);
   if (lastPostTime) {
